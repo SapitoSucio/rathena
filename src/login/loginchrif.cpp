@@ -93,7 +93,10 @@ int logchrif_parse_reqauth(int fd, int id,char* ip){
 			//ShowStatus("Char-server '%s': authentication of the account %d accepted (ip: %s).\n", server[id].name, account_id, ip);
 
 			// send ack
-			WFIFOHEAD(fd,21);
+			if( !battle_config.feature_mac_address )
+				WFIFOHEAD(fd,21);
+			else
+				WFIFOHEAD(fd,21 + MACADDRESS_LENGTH + IP4ADDRESS_LENGTH);
 			WFIFOW(fd,0) = 0x2713;
 			WFIFOL(fd,2) = account_id;
 			WFIFOL(fd,6) = login_id1;
@@ -102,13 +105,23 @@ int logchrif_parse_reqauth(int fd, int id,char* ip){
 			WFIFOB(fd,15) = 0;// ok
 			WFIFOL(fd,16) = request_id;
 			WFIFOB(fd,20) = node->clienttype;
-			WFIFOSET(fd,21);
+			if( !battle_config.feature_mac_address )
+				WFIFOSET(fd,21);
+			else{
+				safestrncpy(WFIFOCP(fd, 21), node->mac_address, MACADDRESS_LENGTH);
+				safestrncpy(WFIFOCP(fd, 21 + MACADDRESS_LENGTH), node->lan_address, IP4ADDRESS_LENGTH);
+				WFIFOSET(fd,21 + MACADDRESS_LENGTH + IP4ADDRESS_LENGTH);
+			}
+			
 
 			// each auth entry can only be used once
 			login_remove_auth_node( account_id );
 		}else{// authentication not found
 			ShowStatus("Char-server '%s': authentication of the account %d REFUSED (ip: %s).\n", ch_server[id].name, account_id, ip);
-			WFIFOHEAD(fd,21);
+			if( !battle_config.feature_mac_address )
+				WFIFOHEAD(fd,21);
+			else
+				WFIFOHEAD(fd,21 + MACADDRESS_LENGTH + IP4ADDRESS_LENGTH);
 			WFIFOW(fd,0) = 0x2713;
 			WFIFOL(fd,2) = account_id;
 			WFIFOL(fd,6) = login_id1;
@@ -117,7 +130,13 @@ int logchrif_parse_reqauth(int fd, int id,char* ip){
 			WFIFOB(fd,15) = 1;// auth failed
 			WFIFOL(fd,16) = request_id;
 			WFIFOB(fd,20) = 0;
-			WFIFOSET(fd,21);
+			if( !battle_config.feature_mac_address )
+				WFIFOSET(fd,21);
+			else{
+				safestrncpy(WFIFOCP(fd, 21), "", MACADDRESS_LENGTH);
+				safestrncpy(WFIFOCP(fd, 21 + MACADDRESS_LENGTH), "", IP4ADDRESS_LENGTH);
+				WFIFOSET(fd,21 + MACADDRESS_LENGTH + IP4ADDRESS_LENGTH);
+			}
 		}
 	}
 	return 1;

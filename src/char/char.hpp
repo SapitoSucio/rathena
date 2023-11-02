@@ -230,6 +230,8 @@ struct auth_node {
 	int group_id;
 	unsigned changing_mapservers : 1;
 	uint8 version;
+	char mac_address[MACADDRESS_LENGTH];	// The MAC address of the user's computer, format: 00-00-00-00-00-00-00-00
+	char lan_address[IP4ADDRESS_LENGTH];	// Intranet IP address of the first network connection of the user's computer, format: 000.000.000.000
 };
 
 std::unordered_map<uint32, std::shared_ptr<struct auth_node>>& char_get_authdb();

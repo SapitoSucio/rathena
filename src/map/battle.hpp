@@ -729,6 +729,7 @@ struct Battle_Config
 	int mob_respawn_time;
 
 	int feature_stylist;
+	int feature_mac_address;
 	int feature_banking_state_enforce;
 	int instance_allow_reconnect;
 

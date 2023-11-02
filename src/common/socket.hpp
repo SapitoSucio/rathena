@@ -98,7 +98,9 @@ struct socket_data
 	} flag;
 
 	uint32 client_addr; // remote client address
-
+	char mac_address[MACADDRESS_LENGTH];	// The MAC address of the user's computer, format: 00-00-00-00-00-00-00-00
+	char lan_address[IP4ADDRESS_LENGTH];	// Intranet IP address of the first network connection of the user's computer, format: 000.000.000.000
+	
 	uint8 *rdata, *wdata;
 	size_t max_rdata, max_wdata;
 	size_t rdata_size, wdata_size;

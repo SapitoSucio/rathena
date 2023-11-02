@@ -318,6 +318,30 @@ static int logclif_parse_reqauth(int fd, struct login_session_data *sd, int comm
 			safestrncpy(username, accname, uAccLen + 1);
 			safestrncpy(password, token, uTokenLen + 1);
 			clienttype = RFIFOB(fd, 8);
+			if( battle_config.feature_mac_address ){
+				// When logging in using SSO (packet 0x0825)
+				// The client also sends additional information, including the MAC address of the client's network card.
+				// In some newer clients, it also sends the IP address of the client's first local network connection.
+				char *pMacAddress = RFIFOCP(fd, 0x3C);
+				char *pLanAddress = RFIFOCP(fd, 0x4D);
+				
+				size_t uMacAddressLen = strlen(pMacAddress);
+				size_t uLanAddressLen = strlen(pLanAddress);
+
+				// Some client versions automatically append 00 to the end of the MAC address.
+				// But some clients have the IP address immediately after the MAC address, so we need to break it down ourselves: 00-1C-42-37-D8-63172.17.191.177
+				if (uMacAddressLen != MACADDRESS_LENGTH - 1)
+					safestrncpy(session[fd]->mac_address, pMacAddress, MACADDRESS_LENGTH - 1);
+				else
+					safestrncpy(session[fd]->mac_address, pMacAddress, uMacAddressLen + 1);
+
+				if (uLanAddressLen > IP4ADDRESS_LENGTH - 1) {
+					logclif_auth_failed(sd, 3);
+					return 0;
+				}
+
+				safestrncpy(session[fd]->lan_address, pLanAddress, uLanAddressLen + 1);
+			}
 		}
 		else
 		{

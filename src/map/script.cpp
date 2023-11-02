@@ -26939,6 +26939,48 @@ BUILDIN_FUNC(macro_detector) {
 	return SCRIPT_CMD_SUCCESS;
 }
 
+/* ===========================================================
+ * Command: getcharmac
+ * Description: Retrieve the MAC address used by the specified character during login
+ * Usage: getcharmac(<accountID>/<charID>/<"characterName">);
+ * Returns: Returns the MAC address on success, an empty string on failure
+ * Author: Sola丶小克
+ * -----------------------------------------------------------*/
+BUILDIN_FUNC(getcharmac) {
+	map_session_data* sd = nullptr;
+
+	if( !battle_config.feature_mac_address ){
+		ShowError( "buildin_getcharmac: MAC Address feature is disabled.\n" );
+		return SCRIPT_CMD_FAILURE;
+	}
+
+	if (script_hasdata(st,2)) {
+		if (script_isstring(st,2)) {
+			sd = map_nick2sd(script_getstr(st,2), false);
+		}
+		else {
+			int id = script_getnum(st,2);
+			sd = (map_id2sd(id) ? map_id2sd(id) : map_charid2sd(id));
+		}
+	}
+	else {
+		script_rid2sd(sd);
+	}
+
+	if (!sd || !strlen(session[sd->fd]->mac_address)) {
+		script_pushconststr(st, "");
+		return SCRIPT_CMD_SUCCESS;
+	}
+
+	if (sd && sd->fd && session[sd->fd]) {
+		script_pushstrcopy(st, session[sd->fd]->mac_address);
+		return SCRIPT_CMD_SUCCESS;
+	}
+
+	script_pushconststr(st, "");
+	return SCRIPT_CMD_SUCCESS;
+}
+
 #include <custom/script.inc>
 
 // declarations that were supposed to be exported from npc_chat.cpp
@@ -27694,6 +27736,8 @@ struct script_function buildin_func[] = {
 	BUILDIN_DEF(getfamerank, "?"),
 	BUILDIN_DEF(isdead, "?"),
 	BUILDIN_DEF(macro_detector, "?"),
+	BUILDIN_DEF(getcharmac, "?"),
+
 
 #include <custom/script_def.inc>
 
