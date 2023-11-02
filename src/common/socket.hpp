@@ -19,6 +19,7 @@
 #include "cbasetypes.hpp"
 #include "malloc.hpp"
 #include "timer.hpp" // t_tick
+#include "mmo.hpp" // MACADDRESS_LENGTH, IP4ADDRESS_LENGTH
 
 #ifndef MAXCONN
 	#define MAXCONN FD_SETSIZE
