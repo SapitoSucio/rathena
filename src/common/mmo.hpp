@@ -165,6 +165,9 @@ const t_itemid WEDDING_RING_F = 2635;
 #define MAX_MEMOPOINTS 3
 #define MAX_SKILLCOOLDOWN 20
 
+#define MACADDRESS_LENGTH (18 + 1)
+#define IP4ADDRESS_LENGTH (16 + 1)
+
 //Size of the fame list arrays.
 #define MAX_FAME_LIST 10
 
