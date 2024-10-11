@@ -1912,4 +1912,4 @@ Allows you to spy on any clan's Clan Chat. At least one member of that clan must
 !!! note
     The map server needs to be configured to enable spying to use this command (`enable_spy: yes`)
 
-```
+
