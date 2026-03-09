@@ -5,6 +5,17 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <cerrno>
+#include <ctime>
+#include <unordered_map>
+
+#ifdef WIN32
+	#include <direct.h>
+	#include <sys/stat.h>
+#else
+	#include <sys/stat.h>
+	#include <sys/types.h>
+#endif
 
 #include <config/core.hpp>
 
@@ -66,6 +77,127 @@ std::string map_server_db = "ragnarok";
 Sql* mmysql_handle;
 Sql* qsmysql_handle; /// For query_sql
 
+FILE *lang_export_fp = nullptr;
+char *lang_export_file = nullptr;
+bool lang_export_split = false;
+const char *default_lang_str = "English";
+uint8 default_lang_id = 0;
+static std::unordered_map<std::string, FILE*> lang_export_split_fp;
+
+static bool path_is_dir(const char *path) {
+	struct stat st;
+	if (!path || !*path)
+		return false;
+	if (stat(path, &st) != 0)
+		return false;
+	return S_ISDIR(st.st_mode) != 0;
+}
+
+static bool mkdir_if_missing(const std::string &dirpath) {
+	if (dirpath.empty())
+		return true;
+
+	struct stat st;
+	if (stat(dirpath.c_str(), &st) == 0)
+		return S_ISDIR(st.st_mode) != 0;
+
+#ifdef WIN32
+	return _mkdir(dirpath.c_str()) == 0 || errno == EEXIST;
+#else
+	return mkdir(dirpath.c_str(), 0755) == 0 || errno == EEXIST;
+#endif
+}
+
+static bool mkdirs_for_file_path(std::string filepath) {
+	for (char &ch : filepath) {
+		if (ch == '\\')
+			ch = '/';
+	}
+
+	size_t pos = 0;
+	while ((pos = filepath.find('/', pos)) != std::string::npos) {
+		std::string dir = filepath.substr(0, pos++);
+		if (dir.empty())
+			continue;
+		if (!mkdir_if_missing(dir))
+			return false;
+	}
+
+	return true;
+}
+
+static void lang_export_write_header(FILE *fp) {
+	char datebuf[40] = "1970-01-01 00:00+0000";
+	time_t now = time(nullptr);
+	struct tm tm_now;
+
+	if (now != (time_t)-1) {
+#ifdef WIN32
+		if (localtime_s(&tm_now, &now) == 0)
+#else
+		if (localtime_r(&now, &tm_now) != nullptr)
+#endif
+		{
+			if (strftime(datebuf, sizeof(datebuf), "%Y-%m-%d %H:%M%z", &tm_now) == 0) {
+				strftime(datebuf, sizeof(datebuf), "%Y-%m-%d %H:%M+0000", &tm_now);
+			}
+		}
+	}
+
+	if (!fp)
+		return;
+
+	fprintf(fp,
+		"msgid \"\"\n"
+		"msgstr \"\"\n"
+		"\"Project-Id-Version: rAthena\\n\"\n"
+		"\"Report-Msgid-Bugs-To: \\n\"\n"
+		"\"POT-Creation-Date: %s\\n\"\n"
+		"\"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\\n\"\n"
+		"\"Last-Translator: FULL NAME <EMAIL@ADDRESS>\\n\"\n"
+		"\"Language-Team: LANGUAGE <LL@li.org>\\n\"\n"
+		"\"Language: \\n\"\n"
+		"\"MIME-Version: 1.0\\n\"\n"
+		"\"Content-Type: text/plain; charset=CP1252\\n\"\n"
+		"\"Content-Transfer-Encoding: 8bit\\n\"\n"
+		"\n"
+	, datebuf);
+}
+
+FILE *lang_export_get_fp(const char *source_file) {
+	if (!lang_export_file)
+		return nullptr;
+
+	if (!lang_export_split)
+		return lang_export_fp;
+
+	std::string rel = (source_file && *source_file) ? source_file : "unknown";
+	for (char &ch : rel) {
+		if (ch == '\\')
+			ch = '/';
+	}
+
+	std::string out = std::string(lang_export_file) + "/" + rel + ".pot";
+	auto it = lang_export_split_fp.find(out);
+	if (it != lang_export_split_fp.end())
+		return it->second;
+
+	if (!mkdirs_for_file_path(out)) {
+		ShowError("--generate-translations: failed to create directory tree for '%s'.\n", out.c_str());
+		return nullptr;
+	}
+
+	FILE *fp = fopen(out.c_str(), "wb");
+	if (!fp) {
+		ShowError("--generate-translations: failed to open '%s' for writing.\n", out.c_str());
+		return nullptr;
+	}
+
+	lang_export_write_header(fp);
+	lang_export_split_fp[out] = fp;
+	return fp;
+}
+
 int32 db_use_sqldbs = 0;
 char barter_table[32] = "barter";
 char buyingstores_table[32] = "buyingstores";
@@ -113,7 +245,6 @@ static DBMap* map_db=nullptr; /// uint32 mapindex -> struct map_data*
 static DBMap* nick_db=nullptr; /// uint32 char_id -> struct charid2nick* (requested names of offline characters)
 static DBMap* charid_db=nullptr; /// uint32 char_id -> map_session_data*
 static DBMap* regen_db=nullptr; /// int32 id -> block_list* (status_natural_heal processing)
-static DBMap* map_msg_db=nullptr;
 
 static int32 map_users=0;
 
@@ -125,10 +256,6 @@ static int32 block_free_count = 0, block_free_lock = 0;
 #define BL_LIST_MAX 1048576
 static block_list *bl_list[BL_LIST_MAX];
 static int32 bl_list_count = 0;
-
-#ifndef MAP_MAX_MSG
-	#define MAP_MAX_MSG 1550
-#endif
 
 struct map_data map[MAX_MAP_PER_SERVER];
 int32 map_num = 0;
@@ -169,6 +296,7 @@ struct map_cache_map_info {
 char motd_txt[256] = "conf/motd.txt";
 char charhelp_txt[256] = "conf/charhelp.txt";
 char channel_conf[256] = "conf/channels.conf";
+char language_conf[256] = "conf/languages.conf";
 
 const char *MSG_CONF_NAME_RUS;
 const char *MSG_CONF_NAME_SPN;
@@ -4203,6 +4331,8 @@ int32 map_config_read(const char *cfgName)
 			console_msg_log = atoi(w2);//[Ind]
 		else if (strcmpi(w1, "console_log_filepath") == 0)
 			safestrncpy(console_log_filepath, w2, sizeof(console_log_filepath));
+		else if (strcmpi(w1, "language_conf") == 0)
+			safestrncpy(language_conf, w2, sizeof(language_conf));
 		else if (strcmpi(w1, "import") == 0)
 			map_config_read(w2);
 		else
@@ -5157,89 +5287,11 @@ void display_helpscreen(bool do_exit)
 	ShowInfo("  --grf-path <file>\t\tAlternative GRF path configuration.\n");
 	ShowInfo("  --inter-config <file>\t\tAlternative inter-server configuration.\n");
 	ShowInfo("  --log-config <file>\t\tAlternative logging configuration.\n");
+	ShowInfo("  --generate-translations <outfile>\tCreates 'outfile' (or default is './lang/generated_translations.pot') file with all translateable strings from scripts, server terminates afterwards.");
 	if( do_exit )
 		exit(EXIT_SUCCESS);
 }
 
-/*======================================================
- * Message System
- *------------------------------------------------------*/
-struct msg_data {
-	char* msg[MAP_MAX_MSG];
-};
-struct msg_data *map_lang2msgdb(uint8 lang){
-	return (struct msg_data*)idb_get(map_msg_db, lang);
-}
-
-void map_do_init_msg(void){
-	int32 test=0, i=0, size;
-	const char * listelang[] = {
-		MSG_CONF_NAME_EN,	//default
-		MSG_CONF_NAME_RUS,
-		MSG_CONF_NAME_SPN,
-		MSG_CONF_NAME_GRM,
-		MSG_CONF_NAME_CHN,
-		MSG_CONF_NAME_MAL,
-		MSG_CONF_NAME_IDN,
-		MSG_CONF_NAME_FRN,
-		MSG_CONF_NAME_POR,
-		MSG_CONF_NAME_THA
-	};
-
-	map_msg_db = idb_alloc(DB_OPT_BASE);
-	size = ARRAYLENGTH(listelang); //avoid recalc
-	while(test!=-1 && size>i){ //for all enable lang +(English default)
-		test = msg_checklangtype(i,false);
-		if(test == 1) msg_config_read(listelang[i],i); //if enabled read it and assign i to langtype
-		i++;
-	}
-}
-void map_do_final_msg(void){
-	DBIterator *iter = db_iterator(map_msg_db);
-	struct msg_data *mdb;
-
-	for (mdb = (struct msg_data *)dbi_first(iter); dbi_exists(iter); mdb = (struct msg_data *)dbi_next(iter)) {
-		_do_final_msg(MAP_MAX_MSG,mdb->msg);
-		aFree(mdb);
-	}
-	dbi_destroy(iter);
-	map_msg_db->destroy(map_msg_db, nullptr);
-}
-void map_msg_reload(void){
-	map_do_final_msg(); //clear data
-	map_do_init_msg();
-}
-int32 map_msg_config_read(const char *cfgName, int32 lang){
-	struct msg_data *mdb;
-
-	if( (mdb = map_lang2msgdb(lang)) == nullptr )
-		CREATE(mdb, struct msg_data, 1);
-	else
-		idb_remove(map_msg_db, lang);
-	idb_put(map_msg_db, lang, mdb);
-
-	if(_msg_config_read(cfgName,MAP_MAX_MSG,mdb->msg)!=0){ //an error occur
-		idb_remove(map_msg_db, lang); //@TRYME
-		aFree(mdb);
-	}
-	return 0;
-}
-const char* map_msg_txt(const map_session_data* sd, int32 msg_number){
-	struct msg_data *mdb;
-	uint8 lang = 0; //default
-	if(sd && sd->langtype) lang = sd->langtype;
-
-	if( (mdb = map_lang2msgdb(lang)) != nullptr){
-		const char *tmp = _msg_txt(msg_number,MAP_MAX_MSG,mdb->msg);
-		if(strcmp(tmp,"??")) //to verify result
-			return tmp;
-		ShowDebug("Message #%d not found for langtype %d.\n",msg_number,lang);
-	}
-	ShowDebug("Selected langtype %d not loaded, trying fallback...\n",lang);
-	if(lang != 0 && (mdb = map_lang2msgdb(0)) != nullptr) //fallback
-		return _msg_txt(msg_number,MAP_MAX_MSG,mdb->msg);
-	return "??";
-}
 
 /**
  * Read the option specified in command line
@@ -5331,18 +5383,6 @@ bool MapServer::initialize( int32 argc, char *argv[] ){
 
 	safestrncpy(console_log_filepath, "./log/map-msg_log.log", sizeof(console_log_filepath));
 
-	/* Multilanguage */
-	MSG_CONF_NAME_EN = "conf/msg_conf/map_msg.conf"; // English (default)
-	MSG_CONF_NAME_RUS = "conf/msg_conf/map_msg_rus.conf";	// Russian
-	MSG_CONF_NAME_SPN = "conf/msg_conf/map_msg_spn.conf";	// Spanish
-	MSG_CONF_NAME_GRM = "conf/msg_conf/map_msg_grm.conf";	// German
-	MSG_CONF_NAME_CHN = "conf/msg_conf/map_msg_chn.conf";	// Chinese
-	MSG_CONF_NAME_MAL = "conf/msg_conf/map_msg_mal.conf";	// Malaysian
-	MSG_CONF_NAME_IDN = "conf/msg_conf/map_msg_idn.conf";	// Indonesian
-	MSG_CONF_NAME_FRN = "conf/msg_conf/map_msg_frn.conf";	// French
-	MSG_CONF_NAME_POR = "conf/msg_conf/map_msg_por.conf";	// Brazilian Portuguese
-	MSG_CONF_NAME_THA = "conf/msg_conf/map_msg_tha.conf";	// Thai
-	/* Multilanguage */
 
 	// default inter_config
 	inter_config.start_status_points = 48;
@@ -5385,6 +5425,38 @@ bool MapServer::initialize( int32 argc, char *argv[] ){
 			chrif_setip(ip_str);
 	}
 
+	// If --generate-translations was passed, open the export file now so
+	// scripts can write translations to it during NPC loading below.
+	if (LANG_EXPORT_FILE) {
+		lang_export_file = aStrdup(LANG_EXPORT_FILE);
+		lang_export_split = path_is_dir(lang_export_file);
+		if (!lang_export_split) {
+			size_t len = strlen(lang_export_file);
+			if (len > 0 && (lang_export_file[len - 1] == '/' || lang_export_file[len - 1] == '\\'))
+				lang_export_split = true;
+			else {
+				bool po_ext = len >= 3 && strcmpi(lang_export_file + len - 3, ".po") == 0;
+				bool pot_ext = len >= 4 && strcmpi(lang_export_file + len - 4, ".pot") == 0;
+				if (!po_ext && !pot_ext)
+					lang_export_split = true;
+			}
+		}
+
+		if (lang_export_split) {
+			if (!mkdir_if_missing(lang_export_file)) {
+				ShowError("--generate-translations: failed to create output directory '%s'.\n", lang_export_file);
+			}
+		} else {
+			if (!(lang_export_fp = fopen(lang_export_file, "wb")))
+				ShowError("--generate-translations: failed to open '%s' for writing!\n", lang_export_file);
+			else
+				lang_export_write_header(lang_export_fp);
+		}
+	}
+	msg_config_read(MSG_MAP_CONF_NAME_EN, false);
+	if (lang_export_file)
+		msg_config_read(MSG_CONF_NAME_EN, false, false);
+
 	battle_config_read(BATTLE_CONF_FILENAME);
 	script_config_read(SCRIPT_CONF_NAME);
 	inter_config_read(INTER_CONF_NAME);
@@ -5413,7 +5485,6 @@ bool MapServer::initialize( int32 argc, char *argv[] ){
 	add_timer_func_list(map_clearflooritem_timer, "map_clearflooritem_timer");
 	add_timer_func_list(map_removemobs_timer, "map_removemobs_timer");
 	
-	map_do_init_msg();
 	do_init_path();
 	do_init_atcommand();
 	do_init_battle();
@@ -5449,6 +5520,25 @@ bool MapServer::initialize( int32 argc, char *argv[] ){
 
 	npc_event_do_oninit();	// Init npcs (OnInit)
 
+	// Close translation export file if --generate-translations was passed
+	if (lang_export_fp) {
+		ShowInfo("Lang exported to '" CL_WHITE "%s" CL_RESET "'\n", lang_export_file);
+		fclose(lang_export_fp);
+		lang_export_fp = nullptr;
+	}
+	if (!lang_export_split_fp.empty()) {
+		for (auto &it : lang_export_split_fp) {
+			if (it.second)
+				fclose(it.second);
+		}
+		ShowInfo("Lang exported by file under '" CL_WHITE "%s" CL_RESET "'\n", lang_export_file);
+		lang_export_split_fp.clear();
+	}
+	if (lang_export_file) {
+		aFree(lang_export_file);
+		lang_export_file = nullptr;
+	}
+	lang_export_split = false;
 	if (battle_config.pk_mode)
 		ShowNotice("Server is running on '" CL_WHITE "PK Mode" CL_RESET "'.\n");
 

@@ -18,8 +18,10 @@
 #include <common/mmo.hpp>
 #include <common/msg_conf.hpp>
 #include <common/timer.hpp>
+#include <common/utils.hpp>
 #include <config/core.hpp>
 
+#include "atcommand.hpp"
 #include "navi.hpp"
 #include "script.hpp"
 #include "path.hpp"
@@ -54,13 +56,6 @@ struct s_mercenary_data;
 struct Channel;
 
 struct map_data *map_getmapdata(int16 m);
-#define msg_config_read(cfgName,isnew) map_msg_config_read(cfgName,isnew)
-#define msg_txt(sd,msg_number) map_msg_txt(sd,msg_number)
-#define do_final_msg() map_do_final_msg()
-int32 map_msg_config_read(const char *cfgName,int32 lang);
-const char* map_msg_txt(const map_session_data* sd,int32 msg_number);
-void map_do_final_msg(void);
-void map_msg_reload(void);
 
 #define MAX_NPC_PER_MAP 512
 #define AREA_SIZE battle_config.area_size
@@ -1114,6 +1109,7 @@ private:
 extern char motd_txt[];
 extern char charhelp_txt[];
 extern char channel_conf[];
+extern char language_conf[];
 
 extern char wisp_server_name[];
 
@@ -1281,16 +1277,10 @@ bool map_setmapflag_sub(int16 m, enum e_mapflag mapflag, bool status, union u_ma
 #define CHK_RACE(race) ((race) > RC_NONE_ && (race) < RC_MAX) /// Check valid Race
 #define CHK_CLASS(class_) ((class_) > CLASS_NONE && (class_) < CLASS_MAX) /// Check valid Class
 
-//Other languages supported
-extern const char*MSG_CONF_NAME_RUS;
-extern const char*MSG_CONF_NAME_SPN;
-extern const char*MSG_CONF_NAME_GRM;
-extern const char*MSG_CONF_NAME_CHN;
-extern const char*MSG_CONF_NAME_MAL;
-extern const char*MSG_CONF_NAME_IDN;
-extern const char*MSG_CONF_NAME_FRN;
-extern const char*MSG_CONF_NAME_POR;
-extern const char*MSG_CONF_NAME_THA;
+extern FILE *lang_export_fp;
+extern char *lang_export_file;
+extern bool lang_export_split;
+FILE *lang_export_get_fp(const char *source_file);
 
 //Useful typedefs from jA [Skotlex]
 typedef map_session_data TBL_PC;
@@ -1322,6 +1312,9 @@ extern Sql* mmysql_handle;
 extern Sql* qsmysql_handle;
 extern Sql* logmysql_handle;
 #endif
+
+extern const char *default_lang_str;
+extern uint8 default_lang_id;
 
 extern char barter_table[32];
 extern char buyingstores_table[32];

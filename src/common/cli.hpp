@@ -17,6 +17,8 @@
  extern const char* ATCOMMAND_CONF_FILENAME;
  extern const char* SCRIPT_CONF_NAME;
  extern const char* GRF_PATH_FILENAME;
+ extern const char* LANG_EXPORT_FILE;
+ extern const char* MSG_MAP_CONF_NAME_EN;
 //char
  extern const char* CHAR_CONF_NAME;
 //login
@@ -30,6 +32,7 @@ extern void display_helpscreen(bool exit);
 bool cli_hasevent();
 void display_versionscreen(bool do_exit);
 bool opt_has_next_value(const char* option, int32 i, int32 argc);
+bool opt_has_next_value_(const char* option, int32 i, int32 argc);
 int32 cli_get_options(int32 argc, char ** argv);
 TIMER_FUNC(parse_console_timer);
 extern int32 parse_console(const char* buf); //particular for each serv

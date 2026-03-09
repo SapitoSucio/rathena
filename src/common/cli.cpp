@@ -17,6 +17,7 @@
 #include "core.hpp"
 #include "showmsg.hpp"
 #include "timer.hpp"
+#include "malloc.h"
 
 using namespace rathena::server_core;
 
@@ -27,6 +28,7 @@ const char* LOG_CONF_NAME = "conf/log_athena.conf";
 const char* BATTLE_CONF_FILENAME = "conf/battle_athena.conf";
 const char* SCRIPT_CONF_NAME = "conf/script_athena.conf";
 const char* GRF_PATH_FILENAME = "conf/grf-files.txt";
+const char* MSG_MAP_CONF_NAME_EN = "conf/msg_conf/map_msg.conf"; // English (default)
 //char confs
 const char* CHAR_CONF_NAME = "conf/char_athena.conf";
 //login confs
@@ -35,6 +37,8 @@ const char *LOGIN_MSG_CONF_NAME = "conf/msg_conf/login_msg.conf";
 //common conf (used by multiple serv)
 const char* LAN_CONF_NAME = "conf/subnet_athena.conf"; //char-login
 const char* MSG_CONF_NAME_EN = "conf/msg_conf/char_msg.conf"; //all
+const char* TRANSLATION_CONF_FILE = "conf/translation.conf";
+const char* LANG_EXPORT_FILE = nullptr; // Set only when --generate-translations is passed
 
 /**
  * Function to check if the specified option has an argument following it.
@@ -53,6 +57,13 @@ bool opt_has_next_value(const char* option, int32 i, int32 argc){
 
 	return true;
 }
+
+bool opt_has_next_value_(const char* option, int32 i, int32 argc){
+	if (i >= argc - 1)
+		return false;
+	return true;
+}
+
 
 /**
  * Display some information about the emulator, such as:
@@ -164,6 +175,13 @@ int32 cli_get_options(int32 argc, char ** argv) {
 				else if (strcmp(arg, "log-config") == 0) {
 					if (opt_has_next_value(arg, i, argc))
 						LOG_CONF_NAME = argv[++i];
+				} 
+				else if (strcmp(arg, "generate-translations") == 0) {
+					if (opt_has_next_value_(arg, i, argc))
+						LANG_EXPORT_FILE = argv[++i];
+					else
+						LANG_EXPORT_FILE = "./lang/generated_translations.pot";
+					global_core->set_run_once( true );
 				}
 				else {
 					ShowError("Unknown option '%s'.\n", argv[i]);

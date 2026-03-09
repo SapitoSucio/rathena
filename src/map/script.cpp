@@ -10,15 +10,20 @@
 #include "script.hpp"
 
 #include <cerrno>
+#include <filesystem>
+#include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <csetjmp>
 #include <cstdlib> // atoi, strtol, strtoll, exit
+#include <vector>
 
 #ifdef PCRE_SUPPORT
 #include <pcre.h> // preg_match
 #endif
 
 #include <common/cbasetypes.hpp>
+#include <common/conf.hpp>
 #include <common/ers.hpp>  // ers_destroy
 #include <common/malloc.hpp>
 #include <common/md5calc.hpp>
@@ -64,6 +69,7 @@
 #include "storage.hpp"
 
 using namespace rathena;
+namespace fs = std::filesystem;
 
 const int64 SCRIPT_INT_MIN = INT64_MIN;
 const int64 SCRIPT_INT_MAX = INT64_MAX;
@@ -229,6 +235,22 @@ static char *str_buf;
 static int32 str_size = 0; // size of the buffer
 static int32 str_pos = 0; // next position to be assigned
 
+char **languages;
+char **lang_motd_txt;
+char **lang_help_txt;
+
+char *parser_current_npc_name = nullptr;
+DBMap *translation_db = nullptr;
+char **translation_buf = nullptr;
+uint32 translation_buf_size = 0;
+
+uint8 max_lang_id = 0;
+
+struct script_string_buf parse_simpleexpr_str = { nullptr, 0, 0 };
+struct script_string_buf lang_export_line_buf = { nullptr, 0, 0 };
+struct script_string_buf lang_export_unescaped_buf = { nullptr, 0, 0 };
+
+int32 parse_cleanup_timer_id = INVALID_TIMER;
 
 // Using a prime number for SCRIPT_HASH_SIZE should give better distributions
 #define SCRIPT_HASH_SIZE 1021
@@ -249,6 +271,23 @@ static int32 buildin_set_ref = 0;
 static int32 buildin_callsub_ref = 0;
 static int32 buildin_callfunc_ref = 0;
 static int32 buildin_getelementofarray_ref = 0;
+
+static int32 buildin_mes_offset = 0;
+static int32 buildin_select_offset = 0;
+static int32 buildin_menu_offset = 0;
+static int32 buildin_dispbottom_offset = 0;
+static int32 buildin_message_offset = 0;
+static int32 buildin_npctalk_offset = 0;
+static int32 buildin_unittalk_offset = 0;
+static int32 buildin_announce_offset = 0;
+static int32 buildin_mapannounce_offset = 0;
+static int32 buildin_areaannounce_offset = 0;
+static int32 buildin_globalmes_offset = 0;
+static int32 buildin_instance_announce_offset = 0;
+static int32 buildin_showscript_offset = 0;
+static int32 buildin_chatmes_offset = 0;
+static int32 buildin_sprintf_offset = 0;
+static int32 buildin_lang_macro_offset = 0;
 
 // Caches compiled autoscript item code.
 // Note: This is not cleared when reloading itemdb.
@@ -351,6 +390,13 @@ static struct {
 	} curly[256];		// Information right parenthesis
 	int32 curly_count;	// The number of right brackets
 	int32 index;			// Number of the syntax used in the script
+	int32 last_func;				// buildin index of the last parsed function
+	int32 nested_call;	// Don't really know what to call this
+	int32 string_assignment;
+	int32 sprintf_call;
+	bool lang_macro_active;
+	DBMap *strings;				// string map parsed (used when exporting strings only)
+	DBMap *translation_db;		// non-null if this NPC has any translated strings to be linked
 } syntax;
 
 const char* parse_curly_close(const char* p);
@@ -390,6 +436,64 @@ const char* parse_subexpr(const char* p,int32 limit);
 int32 run_func(struct script_state *st);
 int32 script_instancegetid(struct script_state *st, e_instance_mode mode = IM_NONE);
 
+static inline void script_string_buf_ensure(script_string_buf *buf, size_t ensure)
+{
+	if (buf->pos + ensure >= buf->size) {
+		do {
+			buf->size += 512;
+		} while (buf->pos+ensure >= buf->size);
+		RECREATE(buf->ptr, char, buf->size);
+	}
+}
+
+static inline void script_string_buf_addb(script_string_buf *buf, uint8 b)
+{
+	if (buf->pos + 1 >= buf->size) {
+		buf->size += 512;
+		RECREATE(buf->ptr, char, buf->size);
+	}
+
+	buf->ptr[buf->pos++] = b;
+}
+
+static inline void script_string_buf_destroy(script_string_buf *buf)
+{
+	if (buf->ptr)
+		aFree(buf->ptr);
+	memset(buf, 0, sizeof(script_string_buf));
+}
+
+static inline void script_string_buf_po_escape(script_string_buf *dst, const char *src)
+{
+	while (*src) {
+		unsigned char c = (unsigned char)*src;
+		switch (c) {
+			case '\\':
+			case '"':
+				script_string_buf_addb(dst, '\\');
+				script_string_buf_addb(dst, c);
+				break;
+			case '\n':
+				script_string_buf_addb(dst, '\\');
+				script_string_buf_addb(dst, 'n');
+				break;
+			case '\r':
+				script_string_buf_addb(dst, '\\');
+				script_string_buf_addb(dst, 'r');
+				break;
+			case '\t':
+				script_string_buf_addb(dst, '\\');
+				script_string_buf_addb(dst, 't');
+				break;
+			default:
+				script_string_buf_addb(dst, c);
+				break;
+		}
+		src++;
+	}
+}
+
+
 const char* script_op2name(int32 op)
 {
 #define RETURN_OP_NAME(type) case type: return #type
@@ -408,6 +512,7 @@ const char* script_op2name(int32 op)
 	RETURN_OP_NAME(C_RETINFO);
 	RETURN_OP_NAME(C_USERFUNC);
 	RETURN_OP_NAME(C_USERFUNC_POS);
+	RETURN_OP_NAME(C_LSTR);
 
 	RETURN_OP_NAME(C_REF);
 
@@ -962,12 +1067,33 @@ const char* parse_callfunc(const char* p, int32 require_paren, int32 is_custom)
 	const char* p2;
 	const char* arg=nullptr;
 	int32 func;
+	int32 prev_last_func = syntax.last_func;
+	bool entered_nested_call = false;
+	bool macro = false;
 
 	func = add_word(p);
+	if (prev_last_func != -1) {
+		syntax.nested_call++;
+		entered_nested_call = true;
+	}
+
 	if( str_data[func].type == C_FUNC ){
-		// buildin function
-		add_scriptl(func);
-		add_scriptc(C_ARG);
+		// Keep outer visible context while parsing sprintf() arguments.
+		if (str_data[func].val != buildin_sprintf_offset || prev_last_func == -1)
+			syntax.last_func = str_data[func].val;
+
+		if (str_data[func].val == buildin_lang_macro_offset) {
+			syntax.lang_macro_active = true;
+			macro = true;
+		}
+		if (str_data[func].val == buildin_sprintf_offset)
+			syntax.sprintf_call++;
+
+		if (!macro) {
+			// buildin function
+			add_scriptl(func);
+			add_scriptc(C_ARG);
+		}
 		arg = buildin_func[str_data[func].val].arg;
 #if defined(SCRIPT_COMMAND_DEPRECATION)
 		if( str_data[func].deprecated ){
@@ -975,6 +1101,7 @@ const char* parse_callfunc(const char* p, int32 require_paren, int32 is_custom)
 			ShowWarning( "This function was deprecated on '%s' and could become unavailable anytime soon.\n", buildin_func[str_data[func].val].deprecated );
 		}
 #endif
+
 	} else if( str_data[func].type == C_USERFUNC || str_data[func].type == C_USERFUNC_POS ){
 		// script defined function
 		add_scriptl(buildin_callsub_ref);
@@ -1052,7 +1179,16 @@ const char* parse_callfunc(const char* p, int32 require_paren, int32 is_custom)
 			disp_error_message("parse_callfunc: expected ')' to close argument list",p);
 		++p;
 	}
-	add_scriptc(C_FUNC);
+	if (str_data[func].val == buildin_lang_macro_offset)
+		syntax.lang_macro_active = false;
+	if (str_data[func].val == buildin_sprintf_offset)
+		syntax.sprintf_call--;
+	if (entered_nested_call)
+		syntax.nested_call--;
+	syntax.last_func = prev_last_func;
+
+	if (!macro)
+		add_scriptc(C_FUNC);
 	return p;
 }
 
@@ -1106,6 +1242,7 @@ void parse_variable_sub_push(int32 word, const char *p2)
 /// @return nullptr if not a variable assignment, the new position otherwise
 const char* parse_variable(const char* p) {
 	int32 word;
+	bool string_assignment = false;
 	c_op type = C_NOP;
 	const char *p2 = nullptr;
 	const char *var = p;
@@ -1215,6 +1352,12 @@ const char* parse_variable(const char* p) {
 
 	// parse the variable currently being modified
 	word = add_word(var);
+	{
+		const char *name = get_str(word);
+		size_t len = strlen(name);
+		if (len > 0 && name[len - 1] == '$')
+			string_assignment = true;
+	}
 
 	if( str_data[word].type == C_FUNC || str_data[word].type == C_USERFUNC || str_data[word].type == C_USERFUNC_POS ) // cannot assign a variable which exists as a function or label
 		disp_error_message("Cannot modify a variable which has the same name as a function or label.", p);
@@ -1232,7 +1375,11 @@ const char* parse_variable(const char* p) {
 		add_scripti(1);
 		add_scriptc(type == C_ADD_PRE ? C_ADD : C_SUB);
 	} else { // Process the value as an expression
+		if (string_assignment)
+			syntax.string_assignment++;
 		p = parse_subexpr(p, -1);
+		if (string_assignment)
+			syntax.string_assignment--;
 
 		if( type != C_EQ )
 		{// push the type of modifier onto the stack
@@ -1287,6 +1434,110 @@ bool is_number(const char *p) {
 	return false;
 }
 
+static const char *script_translate_runtime(const char *msgctxt, const char *msgid, uint8 lang_id) {
+	DBMap *string_db;
+	struct string_translation *st;
+	uint32 cursor = 0;
+
+	if (!translation_db || !msgctxt || !msgid)
+		return msgid;
+
+	string_db = static_cast<DBMap *>(strdb_get(translation_db, msgctxt));
+	if (!string_db)
+		return msgid;
+
+	st = static_cast<struct string_translation *>(strdb_get(string_db, msgid));
+	if (!st || !st->buf)
+		return msgid;
+
+	for (uint8 i = 0; i < st->translations; i++) {
+		uint8 translated_lang_id = RBUFB(st->buf, cursor);
+		cursor += sizeof(uint8);
+
+		if (translated_lang_id == lang_id)
+			return &st->buf[cursor];
+
+		while (st->buf[cursor++]);
+	}
+
+	return msgid;
+}
+
+static bool script_path_has_wildcard(const char *path) {
+	return path && (strchr(path, '*') || strchr(path, '?'));
+}
+
+static bool script_path_match_glob(const char *pattern, const char *value) {
+	if (!pattern || !value)
+		return false;
+
+	while (*pattern) {
+		if (*pattern == '*') {
+			pattern++;
+			if (!*pattern)
+				return true;
+			while (*value) {
+				if (script_path_match_glob(pattern, value))
+					return true;
+				value++;
+			}
+			return false;
+		}
+
+		if (*pattern != '?' && std::tolower(static_cast<unsigned char>(*pattern)) != std::tolower(static_cast<unsigned char>(*value)))
+			return false;
+
+		if (!*value)
+			return false;
+
+		pattern++;
+		value++;
+	}
+
+	return *value == '\0';
+}
+
+static void script_expand_translation_paths(const char *pattern, std::vector<std::string> &out) {
+	fs::path wildcard_path;
+	fs::path base_dir;
+	std::string file_pattern;
+	std::error_code ec;
+
+	if (!pattern || !*pattern)
+		return;
+
+	if (!script_path_has_wildcard(pattern)) {
+		out.emplace_back(pattern);
+		return;
+	}
+
+	wildcard_path = fs::path(pattern);
+	base_dir = wildcard_path.parent_path();
+	file_pattern = wildcard_path.filename().string();
+
+	if (base_dir.empty())
+		base_dir = ".";
+
+	if (!fs::exists(base_dir, ec) || !fs::is_directory(base_dir, ec)) {
+		ShowWarning("script_load_translations: Wildcard path '%s' does not point to an existing directory. Skipping...\n", pattern);
+		return;
+	}
+
+	for (const fs::directory_entry &entry : fs::recursive_directory_iterator(base_dir, ec)) {
+		if (ec)
+			break;
+		if (!entry.is_regular_file(ec))
+			continue;
+		if (!script_path_match_glob(file_pattern.c_str(), entry.path().filename().string().c_str()))
+			continue;
+
+		out.emplace_back(entry.path().generic_string());
+	}
+
+	std::sort(out.begin(), out.end());
+}
+
+
 /*==========================================
  * Analysis section
  *------------------------------------------*/
@@ -1336,28 +1587,116 @@ const char* parse_simpleexpr(const char *p)
 		add_scripti(i);
 		p=np;
 	} else if(*p=='"'){
-		add_scriptc(C_STR);
-		p++;
-		while( *p && *p != '"' ){
-			if( (unsigned char)p[-1] <= 0x7e && *p == '\\' )
-			{
-				char buf[8];
-				size_t len = skip_escaped_c(p) - p;
-				size_t n = sv_unescape_c(buf, p, len);
-				if( n != 1 )
-					ShowDebug("parse_simpleexpr: unexpected length %d after unescape (\"%.*s\" -> %.*s)\n", (int32)n, (int32)len, p, (int32)n, buf);
-				p += len;
-				add_scriptb(*buf);
-				continue;
+		string_translation *st = nullptr;
+		bool duplicate = true;
+		script_string_buf *sbuf = &parse_simpleexpr_str;
+
+		do {
+			p++;
+			while(*p && *p != '"') {
+				if ((unsigned char)p[-1] <= 0x7e && *p == '\\') {
+					char buf[8];
+					size_t len = skip_escaped_c(p) - p;
+					size_t n = sv_unescape_c(buf, p, len);
+					if (n != 1)
+						ShowDebug("parse_simpleexpr: unexpected length %d after unescape (\"%.*s\" -> %.*s)\n", (int32)n, (int32)len, p, (int32)n, buf);
+					p += len;
+					script_string_buf_addb(sbuf, *buf);
+					continue;
+				} else if( *p == '\n' ) {
+					disp_error_message("parse_simpleexpr: unexpected newline @ string",p);
+				}
+				script_string_buf_addb(sbuf, *p++);
 			}
-			else if( *p == '\n' )
-				disp_error_message("parse_simpleexpr: unexpected newline @ string",p);
-			add_scriptb(*p++);
+			if (!*p)
+				disp_error_message("parse_simpleexpr: unexpected eof @ string",p);
+			p++; //'"'
+			p = skip_space(p);
+		} while(*p && *p == '"');
+
+		script_string_buf_addb(sbuf, 0);
+
+		if (!(syntax.translation_db && (st = static_cast<string_translation *>(strdb_get(syntax.translation_db, sbuf->ptr))))) {
+			add_scriptc(C_STR);
+
+			if (script_pos + sbuf->pos >= script_size) {
+				do {
+					script_size += SCRIPT_BLOCK_SIZE;
+				} while(script_pos + sbuf->pos >= script_size );
+				RECREATE(script_buf, unsigned char, script_size);
+			}
+
+			memcpy(script_buf + script_pos, sbuf->ptr, sbuf->pos);
+			script_pos += sbuf->pos;
+		} else {
+			size_t npc_name_len = strlen(parser_current_npc_name) + 1;
+			size_t msgid_len = sbuf->pos;
+			size_t expand = npc_name_len + msgid_len;
+
+			add_scriptc(C_LSTR);
+
+			while(script_pos + expand >= script_size) {
+				script_size += SCRIPT_BLOCK_SIZE;
+				RECREATE(script_buf, unsigned char, script_size);
+			}
+
+			memcpy(script_buf + script_pos, parser_current_npc_name, npc_name_len);
+			script_pos += (int32)npc_name_len;
+			memcpy(script_buf + script_pos, sbuf->ptr, msgid_len);
+			script_pos += (int32)msgid_len;
 		}
-		if(!*p)
-			disp_error_message("parse_simpleexpr: unexpected eof @ string",p);
-		add_scriptb(0);
-		p++;	//'"'
+
+			if (lang_export_file && parser_current_file != nullptr && strncmp(parser_current_file, "npc/", 4) == 0 &&
+				(((syntax.last_func == buildin_mes_offset ||
+					 syntax.last_func == buildin_select_offset ||
+					 syntax.last_func == buildin_menu_offset ||
+					 syntax.last_func == buildin_message_offset ||
+				 syntax.last_func == buildin_dispbottom_offset ||
+				 syntax.last_func == buildin_announce_offset ||
+				 syntax.last_func == buildin_mapannounce_offset ||
+				 syntax.last_func == buildin_areaannounce_offset ||
+				 syntax.last_func == buildin_globalmes_offset ||
+					 syntax.last_func == buildin_instance_announce_offset ||
+					 syntax.last_func == buildin_showscript_offset ||
+					 syntax.last_func == buildin_chatmes_offset ||
+					 syntax.last_func == buildin_npctalk_offset ||
+					 syntax.last_func == buildin_unittalk_offset) &&
+					(!syntax.nested_call || syntax.sprintf_call > 0 ||
+					 syntax.last_func == buildin_select_offset || syntax.last_func == buildin_menu_offset)
+					) || syntax.lang_macro_active || (syntax.string_assignment > 0 && !syntax.nested_call))) {
+				script_string_buf *lbuf = &lang_export_line_buf;
+				script_string_buf *ubuf = &lang_export_unescaped_buf;
+				FILE *export_fp = lang_export_get_fp(parser_current_file ? parser_current_file : "unknown");
+
+				if (!syntax.strings) {
+					syntax.strings = strdb_alloc((DBOptions)(DB_OPT_DUP_KEY|DB_OPT_ALLOW_NULL_DATA), 0);
+				}
+				if (!strdb_exists(syntax.strings, sbuf->ptr)) {
+					strdb_put(syntax.strings, sbuf->ptr, nullptr);
+					duplicate = false;
+				}
+
+				if (export_fp && !duplicate) {
+					script_string_buf_po_escape(ubuf, sbuf->ptr);
+					script_string_buf_addb(ubuf, 0);
+					script_string_buf_po_escape(lbuf, parser_current_npc_name ? parser_current_npc_name : "Unknown NPC");
+				script_string_buf_addb(lbuf, 0);
+
+				fprintf(export_fp, "#: %s\n"
+										"msgctxt \"%s\"\n"
+										"msgid \"%s\"\n"
+										"msgstr \"\"\n",
+						parser_current_file ? parser_current_file : "Unknown File",
+						lbuf->ptr,
+						ubuf->ptr
+				);
+
+				lbuf->pos = 0;
+				ubuf->pos = 0;
+			}
+		}
+
+		sbuf->pos = 0;
 	} else {
 		int32 l;
 		const char* pv;
@@ -1411,6 +1750,7 @@ const char* parse_simpleexpr(const char *p)
 
 	return p;
 }
+
 
 /*==========================================
  * Analysis of the expression
@@ -2260,6 +2600,22 @@ static void add_buildin_func(void)
 			else if (!strcmp(buildin_func[i].name, "callsub")) buildin_callsub_ref = n;
 			else if (!strcmp(buildin_func[i].name, "callfunc")) buildin_callfunc_ref = n;
 			else if( !strcmp(buildin_func[i].name, "getelementofarray") ) buildin_getelementofarray_ref = n;
+			else if( !strcmp(buildin_func[i].name, "mes")) buildin_mes_offset = i;
+			else if( !strcmp(buildin_func[i].name, "select")) buildin_select_offset = i;
+			else if( !strcmp(buildin_func[i].name, "menu")) buildin_menu_offset = i;
+			else if( !strcmp(buildin_func[i].name, "dispbottom")) buildin_dispbottom_offset = i;
+				else if( !strcmp(buildin_func[i].name, "message")) buildin_message_offset = i;
+				else if( !strcmp(buildin_func[i].name, "announce")) buildin_announce_offset = i;
+				else if( !strcmp(buildin_func[i].name, "mapannounce")) buildin_mapannounce_offset = i;
+				else if( !strcmp(buildin_func[i].name, "areaannounce")) buildin_areaannounce_offset = i;
+				else if( !strcmp(buildin_func[i].name, "globalmes")) buildin_globalmes_offset = i;
+				else if( !strcmp(buildin_func[i].name, "instance_announce")) buildin_instance_announce_offset = i;
+				else if( !strcmp(buildin_func[i].name, "showscript")) buildin_showscript_offset = i;
+				else if( !strcmp(buildin_func[i].name, "chatmes")) buildin_chatmes_offset = i;
+				else if( !strcmp(buildin_func[i].name, "sprintf")) buildin_sprintf_offset = i;
+				else if( !strcmp(buildin_func[i].name, "npctalk")) buildin_npctalk_offset = i;
+				else if( !strcmp(buildin_func[i].name, "unittalk")) buildin_unittalk_offset = i;
+				else if( !strcmp(buildin_func[i].name, "_")) buildin_lang_macro_offset = i;
 		}
 	}
 }
@@ -2486,7 +2842,21 @@ struct script_code* parse_script_( const char *src, const char *file, int32 line
 	if( src == nullptr )
 		return nullptr;// empty script
 
+	if (parse_cleanup_timer_id == INVALID_TIMER)
+		parse_cleanup_timer_id = add_timer(gettick() + 10, script_parse_cleanup_timer, 0, 0);
+
+	if (syntax.strings) // Used only when generating translation file
+		db_destroy(syntax.strings);
+
 	memset(&syntax,0,sizeof(syntax));
+
+	syntax.last_func = -1; // As valid values are >= 0
+	if (parser_current_npc_name) {
+		if (!translation_db)
+			script_load_translations();
+		if (translation_db)
+			syntax.translation_db = (DBMap*)strdb_get(translation_db, parser_current_npc_name);
+	}
 
 	script_buf=(unsigned char *)aMalloc(SCRIPT_BLOCK_SIZE*sizeof(unsigned char));
 	script_pos=0;
@@ -4413,17 +4783,34 @@ void run_script_main(struct script_state *st)
 			push_str(stack,C_CONSTSTR,(char*)(st->script->script_buf+st->pos));
 			while(st->script->script_buf[st->pos++]);
 			break;
+		case C_LSTR:
+			{
+				map_session_data *lsd = nullptr;
+				const char *msgctxt = (char *)(&st->script->script_buf[st->pos]);
+				const char *msgid;
+
+				st->pos += (int32)strlen(msgctxt) + 1;
+				msgid = (char *)(&st->script->script_buf[st->pos]);
+				st->pos += (int32)strlen(msgid) + 1;
+
+				if ((!st->rid || !(lsd = map_id2sd(st->rid)) || !lsd->lang_id) && !default_lang_id)
+					script_pushconststr(st, msgid);
+				else
+					script_pushconststr(st, script_translate_runtime(msgctxt, msgid, lsd ? lsd->lang_id : default_lang_id));
+			}
+			break;
 		case C_FUNC:
 			run_func(st);
-			if(st->state==GOTO){
+			if (st->state == GOTO) {
 				st->state = RUN;
-				if( !st->freeloop && gotocount>0 && (--gotocount)<=0 ){
-					ShowError("script:run_script_main: infinity loop !\n");
+				if (!st->freeloop && gotocount>0 && (--gotocount)<=0) {
+					ShowError("run_script: infinity loop !\n");
 					script_reportsrc(st);
-					st->state=END;
+					st->state = END;
 				}
 			}
 			break;
+
 
 		case C_REF:
 			st->op2ref = 1;
@@ -4751,19 +5138,19 @@ void do_final_script() {
 	struct script_state *st;
 
 #ifdef DEBUG_HASH
-	if (battle_config.etc_log)
-	{
+	if (battle_config.etc_log) {
 		FILE *fp = fopen("hash_dump.txt","wt");
 		if(fp) {
 			int32 count[SCRIPT_HASH_SIZE];
 			int32 count2[SCRIPT_HASH_SIZE]; // number of buckets with a certain number of items
 			int32 n=0;
-			int32 min=INT_MAX,max=0,zero=0;
+			int32 min=INT_MAX, max=0, zero=0;
 			double mean=0.0f;
 			double median=0.0f;
 
 			ShowNotice("Dumping script str hash information to hash_dump.txt\n");
 			memset(count, 0, sizeof(count));
+
 			fprintf(fp,"num : hash : data_name\n");
 			fprintf(fp,"---------------------------------------------------------------\n");
 			for(i=LABEL_START; i<str_num; i++) {
@@ -4772,6 +5159,7 @@ void do_final_script() {
 				++count[h];
 			}
 			fprintf(fp,"--------------------\n\n");
+
 			memset(count2, 0, sizeof(count2));
 			for(i=0; i<SCRIPT_HASH_SIZE; i++) {
 				fprintf(fp,"  hash %3d = %d\n",i,count[i]);
@@ -4783,6 +5171,7 @@ void do_final_script() {
 					zero++;
 				++count2[count[i]];
 			}
+
 			fprintf(fp,"\n--------------------\n  items : buckets\n--------------------\n");
 			for( i=min; i <= max; ++i ){
 				fprintf(fp,"  %5d : %7d\n",i,count2[i]);
@@ -4790,8 +5179,7 @@ void do_final_script() {
 			}
 			for( i=min; i <= max; ++i ){
 				n += count2[i];
-				if( n*2 >= SCRIPT_HASH_SIZE )
-				{
+				if( n*2 >= SCRIPT_HASH_SIZE ) {
 					if( SCRIPT_HASH_SIZE%2 == 0 && SCRIPT_HASH_SIZE/2 == n )
 						median = (i+i+1)/2.0f;
 					else
@@ -4810,7 +5198,6 @@ void do_final_script() {
 	db_destroy(scriptlabel_db);
 	userfunc_db->destroy(userfunc_db, db_script_free_code_sub);
 	autobonus_db->destroy(autobonus_db, db_script_free_code_sub);
-
 	ers_destroy(array_ers);
 	if (generic_ui_array)
 		aFree(generic_ui_array);
@@ -4841,7 +5228,412 @@ void do_final_script() {
 		aFree( dummy_sd );
 		dummy_sd = nullptr;
 	}
+
+	// --- Nuevas funciones de limpieza añadidas ---
+	script_clear_translations(false);
+	script_parser_clean_leftovers();
+	
+	if (lang_export_file)
+		aFree(lang_export_file);
 }
+
+/**
+ * Add language name to library
+ * @param name Language name
+ * @return The Language ID
+ **/
+uint8 script_add_language(const char *name) {
+	uint8 lang_id = max_lang_id;
+
+	if (languages) {
+		for (int32 i = 0; i < max_lang_id; i++) {
+			if (languages[i] && strcmpi(languages[i], name) == 0) {
+				return i;
+			}
+		}
+	}
+
+	RECREATE(languages, char *, ++max_lang_id);
+	RECREATE(lang_motd_txt, char *, max_lang_id);
+	RECREATE(lang_help_txt, char *, max_lang_id);
+
+	ShowInfo("Lang: '" CL_WHITE "%d" CL_RESET "': '" CL_WHITE "%s" CL_RESET "'.\n", lang_id, name);
+	languages[lang_id] = aStrdup(name);
+	lang_motd_txt[lang_id] = nullptr;
+	lang_help_txt[lang_id] = nullptr;
+
+	return lang_id;
+}
+
+/**
+ * Add MOTD file for specified language
+ * @param lang_id ID of the language in the library
+ * @param filepath MOTD file path
+ **/
+static void script_add_motd_language(uint8 lang_id, const char *filepath) {
+	if (!languages || lang_id >= max_lang_id || lang_motd_txt[lang_id] != nullptr)
+		return;
+	lang_motd_txt[lang_id] = aStrdup(filepath);
+}
+
+/**
+ * Add Help message file for specified language
+ * @param lang_id ID of the language in the library
+ * @param filepath Help file path
+ **/
+static void script_add_help_language(uint8 lang_id, const char *filepath) {
+	if (!languages || lang_id >= max_lang_id || lang_help_txt[lang_id] != nullptr)
+		return;
+	lang_help_txt[lang_id] = aStrdup(filepath);
+}
+
+/**
+ * Parses conf/translations.conf file
+ **/
+void script_load_translations(void) {
+	config_t translations_conf;
+	const char *config_filename = language_conf;
+	config_setting_t *languages_t = nullptr;
+	int32 size;
+	uint32 total = 0;
+	uint8 k;
+
+	translation_db = strdb_alloc(DB_OPT_DUP_KEY, NAME_LENGTH * 2 + 1);
+	
+	if (languages) {
+		for(int32 i = 0; i < max_lang_id; i++)
+			aFree(languages[i]);
+		aFree(languages);
+	}
+	if (lang_motd_txt) {
+		for(int32 i = 0; i < max_lang_id; i++)
+			aFree(lang_motd_txt[i]);
+		aFree(lang_motd_txt);
+	}
+	if (lang_help_txt) {
+		for(int32 i = 0; i < max_lang_id; i++)
+			aFree(lang_help_txt[i]);
+		aFree(lang_help_txt);
+	}
+	languages = nullptr;
+	lang_motd_txt = nullptr;
+	lang_help_txt = nullptr;
+	max_lang_id = 0;
+
+	script_add_language("English"); // 0 is default
+
+	if (conf_read_file(&translations_conf, config_filename)) {
+		ShowError("script_load_translations: Can't read '%s'\n", config_filename);
+		return;
+	}
+
+	if (config_lookup_string(&translations_conf, "default_language", &default_lang_str)) {
+		ShowInfo("Default language '%s'.\n", default_lang_str);
+	}
+
+	if (!(languages_t = config_lookup(&translations_conf, "languages")) ) {
+		ShowError("script_load_translations: Invalid 'languages' format on '%s'\n", config_filename);
+		return;
+	}
+
+	size = config_setting_length(languages_t);
+
+	for(int32 i = 0; i < size; i++) {
+		uint8 lang_id = 0;
+		int32 count = 0;
+		config_setting_t *language_t = nullptr, *lang_files = nullptr;
+		const char *lang_name = nullptr, *str = nullptr;
+
+		if (!(language_t = config_setting_get_elem(languages_t, i)))
+			continue;
+
+		lang_name = config_setting_name(language_t);
+		lang_id = script_add_language(lang_name);
+
+		// MOTD
+		if (config_setting_lookup_string(language_t, "motd", &str)) {
+			script_add_motd_language(lang_id, str);
+		}
+
+		// @help
+		if (config_setting_lookup_string(language_t, "help", &str)) {
+			script_add_help_language(lang_id, str);
+		}
+
+		// Translations
+		if (!(lang_files = config_setting_get_member(language_t, "lang")) ) {
+			ShowError("script_load_translations: Invalid 'lang' format on '%s'\n", config_filename);
+			continue;
+		}
+
+		count = config_setting_length(lang_files);
+		if (!count) {
+			ShowWarning("script_load_translations: Language '%s' is defined with no translation file. Skipping...\n", lang_name);
+			continue;
+		}
+
+		for (int32 j = 0; j < count; j++) {
+			const char *translation_file = config_setting_get_string_elem(lang_files, j);
+			std::vector<std::string> expanded_files;
+
+			script_expand_translation_paths(translation_file, expanded_files);
+
+			if (expanded_files.empty()) {
+				ShowWarning("script_load_translations: Translation path '%s' for language '%s' matched no files. Skipping...\n", translation_file, lang_name);
+				continue;
+			}
+
+			for (const std::string &expanded_file : expanded_files)
+				total += script_load_translation(lang_id, expanded_file.c_str());
+		}
+	}
+
+	if (total) {
+		DBIterator *main_iter;
+		DBIterator *sub_iter;
+		DBMap *string_db;
+		struct string_translation *st = nullptr;
+		uint32 j = 0;
+
+		CREATE(translation_buf, char *, total);
+		translation_buf_size = total;
+
+		main_iter = db_iterator(translation_db);
+		
+		for(string_db = static_cast<DBMap*>(dbi_first(main_iter)); dbi_exists(main_iter); string_db = static_cast<DBMap*>(dbi_next(main_iter)) ) {
+			sub_iter = db_iterator(string_db);
+
+			for(st = static_cast<struct string_translation*>(dbi_first(sub_iter)); dbi_exists(sub_iter); st = static_cast<struct string_translation*>(dbi_next(sub_iter)) ) {
+				translation_buf[j++] = st->buf;
+			}
+
+			dbi_destroy(sub_iter);
+		}
+
+		dbi_destroy(main_iter);
+	}
+
+	for(k = 0; k < max_lang_id; k++) {
+		if( !strcmpi(languages[k], default_lang_str) ) {
+			break;
+		}
+	}
+
+	if (k == max_lang_id) {
+		ShowError("script_load_translations: Map server 'default_language' setting '%s' is not a loaded language.\n", default_lang_str);
+		default_lang_id = 0;
+	} else {
+		default_lang_id = k;
+	}
+
+	config_destroy(&translations_conf); 
+}
+
+/**
+ * Parses a individual translation file
+ **/
+uint32 script_load_translation(uint8 lang_id, const char *file) {
+	uint32 translations = 0;
+	char line[1024];
+	char msgctxt[NAME_LENGTH * 2 + 1] = { 0 };
+	DBMap *string_db;
+	size_t i;
+	FILE *fp;
+	struct script_string_buf msgid = { 0 }, msgstr = { 0 };
+
+	if (file == nullptr)
+		return 0;
+
+	if (!(fp = fopen(file,"rb")) ) {
+		ShowError("script_load_translation: Failed to open '%s' for reading.\n", file);
+		return 0;
+	}
+
+	if (lang_id >= max_message_table)
+		atcommand_expand_message_table();
+
+	while(fgets(line, sizeof(line), fp)) {
+		size_t len = strlen(line), cursor = 0;
+
+		if (len <= 1) continue;
+		if (line[0] == '#') continue;
+
+		if (strncasecmp(line,"msgctxt \"", 9) == 0) {
+			msgctxt[0] = '\0';
+			for(i = 9; i < len - 2; i++) {
+				if (line[i] == '\\' && line[i+1] == '"') {
+					msgctxt[cursor] = '"';
+					i++;
+				} else {
+					msgctxt[cursor] = line[i];
+				}
+				if (++cursor >= sizeof(msgctxt) - 1)
+					break;
+			}
+			msgctxt[cursor] = '\0';
+		} else if (strncasecmp(line, "msgid \"", 7) == 0) {
+			msgid.pos = 0;
+			for(i = 7; i < len - 2; i++) {
+				if (line[i] == '\\' && line[i+1] == '"') {
+					script_string_buf_addb(&msgid, '"');
+					i++;
+				} else {
+					script_string_buf_addb(&msgid, line[i]);
+				}
+			}
+			script_string_buf_addb(&msgid, 0);
+		} else if (len > 9 && line[9] != '"' && strncasecmp(line, "msgstr \"",8) == 0) {
+			msgstr.pos = 0;
+			for(i = 8; i < len - 2; i++) {
+				if (line[i] == '\\' && line[i+1] == '"') {
+					script_string_buf_addb(&msgstr, '"');
+					i++;
+				} else {
+					script_string_buf_addb(&msgstr, line[i]);
+				}
+			}
+			script_string_buf_addb(&msgstr, 0);
+		}
+
+		if( msgctxt[0] && msgid.pos > 1 && msgstr.pos > 1 ) {
+			size_t msgstr_len = msgstr.pos;
+			uint32 inner_len = 1 + (uint32)msgstr_len + 1; //uint8 lang_id + msgstr_len + '\0'
+
+			static const char *map_msg_ctx_prefix = "map_msg.conf";
+			if (strncasecmp(msgctxt, map_msg_ctx_prefix, strlen(map_msg_ctx_prefix)) == 0) {
+				for(int32 k = 0; k < MAX_MSG; k++) {
+					if (msgid.ptr != nullptr && msg_table[0][k] && strcmpi(msg_table[0][k], msgid.ptr) == 0) {
+						atcommand_msg_set(lang_id, k, msgstr.ptr);
+						break;
+					}
+				}
+			} else {
+				struct string_translation *st = nullptr;
+
+				if (!( string_db = static_cast<DBMap*>(strdb_get(translation_db, msgctxt)))) {
+					string_db = strdb_alloc(DB_OPT_DUP_KEY, 0);
+					strdb_put(translation_db, msgctxt, string_db);
+				}
+
+				if (!(st = static_cast<struct string_translation*>(strdb_get(string_db, msgid.ptr)))) {
+					CREATE(st, struct string_translation, 1);
+					strdb_put(string_db, msgid.ptr, st);
+				}
+
+				RECREATE(st->buf, char, st->len + inner_len);
+				WBUFB(st->buf, st->len) = lang_id;
+				safestrncpy((char*)WBUFP(st->buf, st->len + 1), msgstr.ptr, msgstr_len + 1);
+
+				st->translations++;
+				st->len += inner_len;
+			}
+			msgctxt[0] = '\0';
+			msgid.pos = msgstr.pos = 0;
+			translations++;
+		}
+	}
+
+	fclose(fp);
+
+	script_string_buf_destroy(&msgid);
+	script_string_buf_destroy(&msgstr);
+
+	ShowStatus("Done reading '" CL_WHITE "%u" CL_RESET "' translations in '" CL_WHITE "%s" CL_RESET "'.\n", translations, file);
+	return translations;
+}
+
+/**
+ * Clears translation arrays
+ **/
+void script_clear_translations(bool reload) {
+	if (translation_buf) {
+		for(uint32 i = 0; i < translation_buf_size; i++) {
+			aFree(translation_buf[i]);
+		}
+		aFree(translation_buf);
+	}
+
+	translation_buf = nullptr;
+	translation_buf_size = 0;
+
+	if (languages) {
+		for(uint32 i = 0; i < max_lang_id; i++)
+			aFree(languages[i]);
+		aFree(languages);
+	}
+	if (lang_motd_txt) {
+		for(uint32 i = 0; i < max_lang_id; i++)
+			aFree(lang_motd_txt[i]);
+		aFree(lang_motd_txt);
+	}
+	if (lang_help_txt) {
+		for(uint32 i = 0; i < max_lang_id; i++)
+			aFree(lang_help_txt[i]);
+		aFree(lang_help_txt);
+	}
+	languages = nullptr;
+	lang_motd_txt = nullptr;
+	lang_help_txt = nullptr;
+	max_lang_id = 0;
+
+	if (translation_db) {
+		translation_db->clear(translation_db, script_translation_db_destroyer);
+		db_destroy(translation_db);
+		translation_db = nullptr;
+	}
+
+	if (reload)
+		script_load_translations();
+}
+
+/**
+ * Destroyer for Translation DB
+ **/
+int32 script_translation_db_destroyer(DBKey key, DBData *data, va_list ap) {
+	DBMap *string_db = static_cast<DBMap*>(db_data2ptr(data));
+
+	if (db_size(string_db)) {
+		DBIterator *iter = db_iterator(string_db);
+		struct string_translation *st = nullptr;
+
+		for(st = static_cast<struct string_translation*>(dbi_first(iter)); dbi_exists(iter); st = static_cast<struct string_translation*>(dbi_next(iter))) {
+			aFree(st);
+		}
+
+		dbi_destroy(iter);
+	}
+
+	db_destroy(string_db);
+	return 0;
+}
+
+/**
+ * Cleans parser leftovers
+ **/
+void script_parser_clean_leftovers(void) {
+	script_buf = nullptr;
+	script_size = 0;
+
+	if (syntax.strings) { 
+		db_destroy(syntax.strings);
+		syntax.strings = nullptr;
+	}
+
+	script_string_buf_destroy(&parse_simpleexpr_str);
+	script_string_buf_destroy(&lang_export_line_buf);
+	script_string_buf_destroy(&lang_export_unescaped_buf);
+}
+
+/**
+ * Performs cleanup after all parsing is processed
+ **/
+int32 script_parse_cleanup_timer(int32 tid, t_tick tick, int32 id, intptr_t data) {
+	script_parser_clean_leftovers();
+	parse_cleanup_timer_id = INVALID_TIMER;
+
+	return 0;
+}
+
 /*==========================================
  * Initialization
  *------------------------------------------*/
@@ -4850,12 +5642,15 @@ void do_init_script(void) {
 	userfunc_db = strdb_alloc(DB_OPT_DUP_KEY,0);
 	scriptlabel_db = strdb_alloc(DB_OPT_DUP_KEY,50);
 	autobonus_db = strdb_alloc(DB_OPT_DUP_KEY,0);
+	parse_cleanup_timer_id = INVALID_TIMER;
 
 	st_ers = ers_new(sizeof(struct script_state), "script.cpp::st_ers", ERS_CACHE_OPTIONS);
 	stack_ers = ers_new(sizeof(struct script_stack), "script.cpp::script_stack", ERS_OPT_FLEX_CHUNK);
 	array_ers = ers_new(sizeof(struct script_array), "script.cpp:array_ers", ERS_CLEAN_OPTIONS);
 
 	add_timer_func_list( run_script_timer, "run_script_timer" );
+
+	script_load_translations();
 
 	ers_chunk_size(st_ers, 10);
 	ers_chunk_size(stack_ers, 10);
@@ -4881,6 +5676,13 @@ void script_reload(void) {
 
 	userfunc_db->clear(userfunc_db, db_script_free_code_sub);
 	db_clear(scriptlabel_db);
+
+	script_clear_translations(true);
+
+	if (parse_cleanup_timer_id != INVALID_TIMER) {
+		delete_timer(parse_cleanup_timer_id, script_parse_cleanup_timer);
+		parse_cleanup_timer_id = INVALID_TIMER;
+	}
 
 	// @commands (script based)
 	// Clear bindings
@@ -27877,6 +28679,11 @@ BUILDIN_FUNC(mesemotion){
 
 #include <custom/script.inc>
 
+/** place holder for the translation macro _ **/
+BUILDIN_FUNC(lang_macro) {
+	return SCRIPT_CMD_SUCCESS;
+}
+
 // declarations that were supposed to be exported from npc_chat.cpp
 #ifdef PCRE_SUPPORT
 BUILDIN_FUNC(defpattern);
@@ -28655,6 +29462,7 @@ struct script_function buildin_func[] = {
 	BUILDIN_DEF(mesemotion,"i"),
 
 #include <custom/script_def.inc>
+	BUILDIN_DEF2(lang_macro, "_", "s"),
 
 	{nullptr,nullptr,nullptr},
 };
