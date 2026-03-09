@@ -11,10 +11,20 @@
 
 class map_session_data;
 
+#define MAX_MSG 2000
+#define msg_txt(sd, msg_number) atcommand_msgsd((sd), (msg_number))
+
 //global var
 extern char atcommand_symbol;
 extern char charcommand_symbol;
 extern int32 atcmd_binding_count;
+
+/**
+ * msg_table[lang_id][msg_id]
+ **/
+extern char*** msg_table;
+extern uint8 max_message_table;
+
 
 enum AtCommandType : uint8 {
 	COMMAND_ATCOMMAND = 1,
@@ -41,5 +51,14 @@ struct atcmd_binding_data {
 };
 extern struct atcmd_binding_data** atcmd_binding;
 struct atcmd_binding_data* get_atcommandbind_byname(const char* name);
+
+const char* atcommand_msg(int32 msg_number);
+const char* atcommand_msgsd(const map_session_data *sd, int32 msg_number);
+void atcommand_expand_message_table();
+void atcommand_msg_set(uint8 lang_id, uint16 num, char *ptr);
+
+bool msg_config_read(const char *cfg_name, bool allow_override, bool store_messages = true);
+bool msg_config_reload(void);
+void do_final_msg();
 
 #endif /* ATCOMMAND_HPP */

@@ -234,6 +234,7 @@ typedef enum c_op {
 	C_USERFUNC, // internal script function
 	C_USERFUNC_POS, // internal script function label
 	C_REF, // the next call to c_op2 should push back a ref to the left operand
+	C_LSTR,
 
 	// operators
 	C_OP3, // a ? b : c
@@ -349,6 +350,17 @@ struct script_array {
 	uint32 id;       ///< the first 32b of the 64b uid, aka the id
 	uint32 size;     ///< how many members
 	uint32 *members; ///< member list
+};
+
+struct script_string_buf {
+	char *ptr;
+	size_t pos,size;
+};
+
+struct string_translation {
+	uint8 translations;
+	uint32 len;
+	char *buf;
 };
 
 enum script_parse_options {
@@ -2298,6 +2310,21 @@ extern uint32 next_id;
 extern struct eri *st_ers;
 extern struct eri *stack_ers;
 
+// Set and unset on npc_parse_script
+extern char *parser_current_npc_name;
+extern DBMap *translation_db; // npc_name => DBMap (strings)
+extern char **translation_buf;
+extern uint32 translation_buf_size;
+extern char **languages;
+extern char **lang_motd_txt;
+extern char **lang_help_txt;
+extern uint8 max_lang_id;
+extern struct script_string_buf parse_simpleexpr_str;
+extern struct script_string_buf lang_export_line_buf;
+extern struct script_string_buf lang_export_unescaped_buf;
+extern int32 parse_cleanup_timer_id;
+
+
 const char* skip_space(const char* p);
 void script_error(const char* src, const char* file, int32 start_line, const char* error_msg, const char* error_pos);
 void script_warning(const char* src, const char* file, int32 start_line, const char* error_msg, const char* error_pos);
@@ -2349,6 +2376,14 @@ void do_final_script(void);
 int32 add_str(const char* p);
 const char* get_str(int32 id);
 void script_reload(void);
+
+void script_load_translations(void);
+uint32 script_load_translation(uint8 lang_id, const char *file);
+int32 script_translation_db_destroyer(DBKey key, DBData *data, va_list ap);
+void script_clear_translations(bool reload);
+int32 script_parse_cleanup_timer(int32 tid, t_tick tick, int32 id, intptr_t data);
+uint8 script_add_language(const char *name);
+void script_parser_clean_leftovers(void);
 
 void setd_sub_num( struct script_state* st, map_session_data* sd, const char* varname, int32 elem, int64 value, struct reg_db* ref );
 void setd_sub_str( struct script_state* st, map_session_data* sd, const char* varname, int32 elem, const char* value, struct reg_db* ref );

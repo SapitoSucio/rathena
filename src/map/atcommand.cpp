@@ -85,6 +85,50 @@ struct s_atcommand_alias_info{
 	std::string help;
 };
 
+char*** msg_table;
+uint8 max_message_table;
+
+static void po_escape_and_write(FILE *fp, const char *str) {
+	if (!fp || !str)
+		return;
+
+	while (*str) {
+		unsigned char c = (unsigned char)*str;
+		switch (c) {
+			case '\\':
+			case '"':
+				fputc('\\', fp);
+				fputc(c, fp);
+				break;
+			case '\n':
+				fputs("\\n", fp);
+				break;
+			case '\r':
+				fputs("\\r", fp);
+				break;
+			case '\t':
+				fputs("\\t", fp);
+				break;
+			default:
+				fputc(c, fp);
+				break;
+		}
+		str++;
+	}
+}
+
+static const char *po_file_context(const char *path) {
+	const char *s = path;
+	const char *base = path;
+	if (!path || !*path)
+		return "unknown";
+	while (*s) {
+		if (*s == '/' || *s == '\\')
+			base = s + 1;
+		s++;
+	}
+	return base;
+}
 
 char atcommand_symbol = '@'; // first char of the commands
 char charcommand_symbol = '#';
@@ -215,6 +259,128 @@ struct atcmd_binding_data* get_atcommandbind_byname(const char* name) {
 	ARR_FIND( 0, atcmd_binding_count, i, strcmpi(atcmd_binding[i]->command, name) == 0 );
 
 	return ( i < atcmd_binding_count ) ? atcmd_binding[i] : nullptr;
+}
+
+const char* atcommand_msgsd(const map_session_data *sd, int32 msg_number) {
+    if (!(msg_number >= 0 && msg_number < MAX_MSG))
+        return "??";
+    if (!sd || sd->lang_id >= max_message_table || !msg_table[sd->lang_id][msg_number] )
+        return msg_table[0][msg_number];
+    return msg_table[sd->lang_id][msg_number];
+}
+
+/**
+ * Return the message string of the specified number by [Yor]
+ */
+const char* atcommand_msg(int32 msg_number) {
+    if (msg_number >= 0 && msg_number < MAX_MSG) {
+        if(msg_table[default_lang_id][msg_number] != nullptr && msg_table[default_lang_id][msg_number][0] != '\0')
+            return msg_table[default_lang_id][msg_number];
+
+        if(msg_table[0][msg_number] != nullptr && msg_table[0][msg_number][0] != '\0')
+            return msg_table[0][msg_number];
+    }
+    return "??";
+}
+
+/**
+ * Reads Message Data
+ *
+ * @param[in] cfg_name       configuration filename to read.
+ * @param[in] allow_override whether to allow duplicate message IDs to override the original value.
+ * @return success state.
+ */
+bool msg_config_read(const char *cfg_name, bool allow_override, bool store_messages) {
+    int32 msg_number, msg_count = 0;
+    char line[1024], w1[16], w2[1024];
+    FILE *fp;
+    FILE *export_fp = nullptr;
+    const char *cfg_ctx = po_file_context(cfg_name);
+
+    if ((fp = fopen(cfg_name, "r")) == nullptr) {
+        ShowError("Messages file not found: %s\n", cfg_name);
+        return false;
+    }
+
+    if (store_messages && !max_message_table)
+        atcommand_expand_message_table();
+
+    while(fgets(line, sizeof(line), fp)) {
+        if (line[0] == '/' && line[1] == '/')
+            continue;
+        if (sscanf(line, "%15[^:]: %1023[^\r\n]", w1, w2) != 2)
+            continue;
+
+        if (strcmpi(w1, "import") == 0) {
+            msg_config_read(w2, true, store_messages);
+        } else {
+            msg_number = atoi(w1);
+            if (msg_number >= 0 && msg_number < MAX_MSG) {
+                if (store_messages) {
+                    if (msg_table[0][msg_number] != nullptr) {
+                        if (!allow_override) {
+                            ShowError("Duplicate message: ID '%d' was already used for '%s'. Message '%s' will be ignored.\n",
+                                msg_number, w2, msg_table[0][msg_number]);
+                            continue;
+                        }
+                        aFree(msg_table[0][msg_number]);
+                    }
+                    msg_table[0][msg_number] = (char *)aMalloc((strlen(w2) + 1)*sizeof (char));
+                    strcpy(msg_table[0][msg_number],w2);
+                }
+                msg_count++;
+
+                if (!export_fp)
+                    export_fp = lang_export_get_fp(cfg_name);
+
+                if (export_fp) {
+                    fprintf(export_fp, "#: %s::[%d]\n"
+                        "msgctxt \"%s::[%d]\"\n"
+                        "msgid \"",
+                        cfg_name, msg_number, cfg_ctx, msg_number);
+                    po_escape_and_write(export_fp, w2);
+                    fprintf(export_fp, "\"\n"
+                        "msgstr \"\"\n");
+                }
+            }
+        }
+    }
+
+    ShowInfo("Done reading " CL_WHITE "'%d'" CL_RESET " messages in " CL_WHITE "'%s'" CL_RESET ".\n", msg_count, cfg_name);
+    fclose(fp);
+
+    return true;
+}
+
+/**
+ * Reloads the base message table and all configured translations.
+ */
+bool msg_config_reload(void) {
+    do_final_msg();
+
+    if (!msg_config_read(MSG_MAP_CONF_NAME_EN, true))
+        return false;
+
+    script_clear_translations(true);
+    return true;
+}
+
+/**
+ * Cleanup Message Data
+ */
+void do_final_msg(void) {
+    for(int32 i = 0; i < max_message_table; i++) {
+        for (int32 j = 0; j < MAX_MSG; j++) {
+            if (msg_table[i][j])
+                aFree(msg_table[i][j]);
+        }
+        aFree(msg_table[i]);
+    }
+
+    if (msg_table)
+        aFree(msg_table);
+    msg_table = nullptr;
+    max_message_table = 0;
 }
 
 /**
@@ -4517,11 +4683,12 @@ ACMD_FUNC(reloadquestdb){
 ACMD_FUNC(reloadmsgconf){
 	nullpo_retr(-1, sd);
 
-	map_msg_reload();
-	clif_displaymessage(fd, msg_txt(sd,463)); // Message configuration has been reloaded.
+	if (msg_config_reload())
+		clif_displaymessage(fd, msg_txt(sd,463)); // Message configuration has been reloaded.
 
 	return 0;
 }
+
 
 ACMD_FUNC(reloadinstancedb){
 	nullpo_retr(-1, sd);
@@ -10591,39 +10758,34 @@ ACMD_FUNC(fontcolor)
 	return 0;
 }
 
-ACMD_FUNC(langtype)
+ACMD_FUNC(langtype) 
 {
-	char langstr[8];
-	int32 i=0, fail=0;
+    char langstr[16];
+    int32 i = 0;
 
-	memset(langstr, '\0', sizeof(langstr));
+    memset(langstr, '\0', sizeof(langstr));
 
-	if(sscanf(message, "%3s", langstr) >= 1){
-		int32 lang=0;
-		lang = msg_langstr2langtype(langstr); //Switch langstr to associated langtype
-		if( msg_checklangtype(lang,false) == 1 ){ //Verify it's enabled and set it
-			char output[100];
-			pc_setaccountreg(sd, add_str(LANGTYPE_VAR), lang); //For login/char
-			sd->langtype = lang;
-			sprintf(output,msg_txt(sd,461),msg_langtype2langstr(lang)); // Language is now set to %s.
-			clif_displaymessage(fd,output);
-			return 0;
-		} else if (lang != -1) { //defined langage but failed check
-			clif_displaymessage(fd,msg_txt(sd,462)); // This langage is currently disabled.
-			return -1;
-		}
-	}
+    if(sscanf(message, "%15s", langstr) >= 1){
+        for (i = 0; i < max_lang_id; i++) {
+            if (strcmpi(languages[i], langstr) == 0)
+                break;
+        }
+        return pc_set_language(sd, i) ? 0 : -1;
+    }
 
-	//wrong or no entry
-	clif_displaymessage(fd,msg_txt(sd,460)); // Please enter a valid language (usage: @langtype <language>).
-	clif_displaymessage(fd,msg_txt(sd,464)); // ---- Available languages:
-	while(fail != -1){ //out of range
-		fail = msg_checklangtype(i,false);
-		if(fail == 1)
-			clif_displaymessage(fd,msg_langtype2langstr(i));
-		i++;
-	}
-	return -1;
+    //wrong or no entry
+    clif_displaymessage(fd, msg_txt(sd, 460)); // Please enter a valid language (usage: @langtype <language>).
+    clif_displaymessage(fd, msg_txt(sd, 464)); // ---- Available languages:
+    
+    for (i = 0; i < max_lang_id; i++) {
+        char output[CHAT_SIZE_MAX];
+        sprintf(output, "- %s", languages[i]);
+        if (sd->lang_id == i)
+            strcat(output, "*");
+        clif_displaymessage(fd, output);
+    }
+
+    return -1;
 }
 
 ACMD_FUNC(vip) {
@@ -12152,6 +12314,17 @@ void atcommand_doload(void) {
 
 	dbi_destroy( atcommand_iter );
 #endif
+}
+
+void atcommand_expand_message_table(void) {
+    RECREATE(msg_table, char **, ++max_message_table);
+    CREATE(msg_table[max_message_table - 1], char *, MAX_MSG);
+}
+
+void atcommand_msg_set(uint8 lang_id, uint16 num, char *ptr) {
+    if (msg_table[lang_id][num] != nullptr)
+        aFree(msg_table[lang_id][num]);
+    msg_table[lang_id][num] = aStrdup(ptr);
 }
 
 void do_init_atcommand(void) {

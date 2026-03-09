@@ -481,7 +481,7 @@ public:
 	std::bitset<PC_PERM_MAX> permissions; // group permissions have to be copied, because they might be adjusted by atcommand addperm
 	int32 count_rewarp; //count how many time we being rewarped
 
-	int32 langtype;
+	uint8 lang_id;
 	struct mmo_charstatus status;
 
 	// Item Storages
@@ -1767,7 +1767,7 @@ bool pc_is_same_equip_index(enum equip_index eqi, const int16* equip_index, int1
 TIMER_FUNC(pc_autotrade_timer);
 
 void pc_validate_skill(map_session_data *sd);
-
+bool pc_set_language(map_session_data *sd, uint8 lang_id);
 void pc_show_questinfo(map_session_data *sd);
 void pc_show_questinfo_reinit(map_session_data *sd);
 
