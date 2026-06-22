@@ -5163,12 +5163,9 @@ void do_final_script() {
 			memset(count2, 0, sizeof(count2));
 			for(i=0; i<SCRIPT_HASH_SIZE; i++) {
 				fprintf(fp,"  hash %3d = %d\n",i,count[i]);
-				if(min > count[i])
-					min = count[i];		// minimum count of collision
-				if(max < count[i])
-					max = count[i];		// maximum count of collision
-				if(count[i] == 0)
-					zero++;
+				if(min > count[i]) min = count[i]; // minimun count of collision
+				if(max < count[i]) max = count[i]; // maximun count of collision
+				if(count[i] == 0) zero++;
 				++count2[count[i]];
 			}
 
